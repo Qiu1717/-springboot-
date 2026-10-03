@@ -1,0 +1,45 @@
+# ===== 默认按文本处理，提交时统一 LF 换行 =====
+* text=auto eol=lf
+
+# ===== 明确声明二进制文件，禁止文本转换/差异比较 =====
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.webp   binary
+*.pdf    binary
+*.docx   binary
+*.pptx   binary
+*.xlsx   binary
+*.jar    binary
+*.zip    binary
+*.gz     binary
+*.class  binary
+
+# ===== 保留 Windows 换行的脚本（避免批处理在 Linux 下失效）=====
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.ps1    text eol=crlf
+
+# ===== 明确需要 LF 的文件 =====
+*.sh     text eol=lf
+*.js     text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.xml    text eol=lf
+*.java   text eol=lf
+*.vue    text eol=lf
+*.css    text eol=lf
+*.html   text eol=lf
+*.md     text eol=lf
+*.sql    text eol=lf
+*.properties text eol=lf
+*.gitignore    text eol=lf
+*.gitattributes text eol=lf
+
+# =====  linguist 统计：把文档与生成文件排除出语言占比 =====
+*.docx   linguist-documentation
+*.pptx   linguist-documentation
+*.md     linguist-documentation

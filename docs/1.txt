@@ -1,0 +1,1364 @@
+学生选课管理系统 - 详细开发文档
+本开发文档严格按照课程设计任务书要求编写，涵盖系统设计、数据库设计、后端代码实现（SpringBoot + MyBatis + Redis + Quartz + Spring Security + Mail）、前端代码实现（Vue + Element UI + Axios）、整合技术示例、部署说明等。文档详细到每一行关键代码，可直接用于开发指导。
+
+目录
+系统概述
+
+开发环境与技术栈
+
+数据库设计
+
+项目结构与配置
+
+公共模块实现
+
+统一返回结果
+
+异常处理
+
+JWT工具类
+
+安全框架整合（Spring Security + JWT）
+
+缓存整合（Redis）
+
+定时任务整合（Quartz）
+
+邮件服务整合（JavaMail）
+
+管理员模块实现
+
+菜单管理
+
+公告管理
+
+教师管理
+
+角色权限管理
+
+教师模块实现
+
+课程查看
+
+成绩录入
+
+学生模块实现
+
+首页公告展示
+
+选课中心
+
+选课统计
+
+前端Vue实现
+
+项目初始化
+
+登录页面
+
+学生选课中心
+
+教师成绩录入
+
+管理员后台
+
+部署与测试
+
+课程设计评分对应说明
+
+1. 系统概述
+系统名称：学生选课管理系统
+目标：实现学校在线选课、成绩管理、公告发布等功能，替代人工统计，提升教务效率。
+角色：
+
+管理员：菜单管理、教务管理（公告）、人员管理（教师）、角色权限管理。
+
+教师：查看课程、按学年/课程/学生录入成绩。
+
+学生：查看公告、选课、查看已选课程及成绩。
+
+2. 开发环境与技术栈
+类别	技术
+后端框架	Spring Boot 2.7.x
+持久层	MyBatis-Plus 3.5.x
+安全框架	Spring Security + JWT
+缓存	Redis（Spring Cache）
+定时任务	Quartz（Spring @Scheduled）
+邮件	JavaMail
+数据库	MySQL 8.0
+前端框架	Vue 2.x + Element UI + Axios
+开发工具	IntelliJ IDEA, VS Code
+构建工具	Maven
+JDK	1.8
+3. 数据库设计
+3.1 ER图（实体关系）
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+3.2 表结构详细SQL
+sql
+-- 数据库创建
+CREATE DATABASE IF NOT EXISTS course_selection
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_unicode_ci;
+USE course_selection;
+
+-- 1. 用户表（包含学生、教师、管理员）
+CREATE TABLE `user` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT COMMENT '用户ID',
+  `username` VARCHAR(50) NOT NULL UNIQUE COMMENT '账号',
+  `password` VARCHAR(100) NOT NULL COMMENT '密码（BCrypt加密）',
+  `real_name` VARCHAR(50) NOT NULL COMMENT '真实姓名',
+  `role` TINYINT NOT NULL COMMENT '角色：0管理员，1教师，2学生',
+  `email` VARCHAR(100) COMMENT '邮箱（用于通知）',
+  `disabled` TINYINT DEFAULT 0 COMMENT '是否禁用：0正常，1禁用',
+  `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. 课程表
+CREATE TABLE `course` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `name` VARCHAR(100) NOT NULL COMMENT '课程名称',
+  `credit` FLOAT NOT NULL COMMENT '学分',
+  `teacher_id` INT NOT NULL COMMENT '教师ID（关联user.id）',
+  `capacity` INT NOT NULL COMMENT '总容量',
+  `selected` INT DEFAULT 0 COMMENT '已选人数',
+  `term` VARCHAR(20) NOT NULL COMMENT '学期，如2025-2026-1',
+  `schedule` VARCHAR(200) COMMENT '上课时间地点',
+  `status` TINYINT DEFAULT 1 COMMENT '状态：1启用，0禁用',
+  FOREIGN KEY (`teacher_id`) REFERENCES `user`(`id`)
+);
+
+-- 3. 选课记录表
+CREATE TABLE `selection` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `student_id` INT NOT NULL,
+  `course_id` INT NOT NULL,
+  `score` FLOAT DEFAULT NULL COMMENT '成绩',
+  `select_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_student_course` (`student_id`, `course_id`),
+  FOREIGN KEY (`student_id`) REFERENCES `user`(`id`),
+  FOREIGN KEY (`course_id`) REFERENCES `course`(`id`)
+);
+
+-- 4. 公告表
+CREATE TABLE `notice` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `title` VARCHAR(200) NOT NULL,
+  `content` TEXT NOT NULL,
+  `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `update_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 5. 菜单表（用于RBAC）
+CREATE TABLE `menu` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `name` VARCHAR(50) NOT NULL,
+  `path` VARCHAR(200) COMMENT '前端路由',
+  `permission` VARCHAR(100) COMMENT '权限标识，如 admin:menu:add',
+  `parent_id` INT DEFAULT 0,
+  `sort` INT DEFAULT 0,
+  `disabled` TINYINT DEFAULT 0 COMMENT '0启用，1禁用'
+);
+
+-- 6. 角色表
+CREATE TABLE `role` (
+  `id` INT PRIMARY KEY AUTO_INCREMENT,
+  `name` VARCHAR(50) NOT NULL,
+  `code` VARCHAR(50) NOT NULL UNIQUE
+);
+
+-- 7. 角色菜单关联表
+CREATE TABLE `role_menu` (
+  `role_id` INT,
+  `menu_id` INT,
+  PRIMARY KEY (`role_id`, `menu_id`)
+);
+
+-- 初始化数据（管理员账号 admin/123456，密码需BCrypt加密）
+-- BCrypt加密后的"123456"示例密码（实际可用工具生成）
+INSERT INTO `user` (`username`, `password`, `real_name`, `role`, `email`) VALUES
+('admin', '$2a$10$NkMl0Kjx6j7blwYh9lHlTun1oHk7x5X5x5X5x5X5x5X5x5X5x5X5', '系统管理员', 0, 'admin@example.com'),
+('teacher1', '$2a$10$NkMl0Kjx6j7blwYh9lHlTun1oHk7x5X5x5X5x5X5x5X5x5X5x5X5', '张老师', 1, 'teacher1@example.com'),
+('student1', '$2a$10$NkMl0Kjx6j7blwYh9lHlTun1oHk7x5X5x5X5x5X5x5X5x5X5x5X5', '李学生', 2, 'student1@example.com');
+
+INSERT INTO `course` (`name`, `credit`, `teacher_id`, `capacity`, `selected`, `term`, `schedule`) VALUES
+('Java程序设计', 3.0, 2, 50, 0, '2025-2026-1', '周一 1-2节 机房A101'),
+('数据库原理', 2.5, 2, 40, 0, '2025-2026-1', '周二 3-4节 教学楼B202');
+
+INSERT INTO `notice` (`title`, `content`) VALUES
+('欢迎使用选课系统', '本学期选课时间为2025年9月1日至9月10日，请同学们按时选课。');
+4. 项目结构与配置
+4.1 后端项目结构
+text
+course-selection-backend/
+├── src/main/java/com/edu/course/
+│   ├── config/               # 配置类（Security, Redis, Swagger等）
+│   ├── controller/           # 控制器
+│   │   ├── AdminController.java
+│   │   ├── TeacherController.java
+│   │   ├── StudentController.java
+│   │   └── AuthController.java
+│   ├── service/              # 业务层接口及实现
+│   │   ├── UserService.java
+│   │   ├── CourseService.java
+│   │   ├── SelectionService.java
+│   │   └── NoticeService.java
+│   ├── mapper/               # MyBatis-Plus Mapper接口
+│   ├── entity/               # 实体类
+│   ├── dto/                  # 数据传输对象（请求/响应）
+│   ├── common/               # 通用类（统一返回结果、异常处理）
+│   ├── security/             # Spring Security + JWT
+│   ├── util/                 # 工具类（JwtUtil, RedisUtil等）
+│   └── CourseApplication.java # 启动类
+├── src/main/resources/
+│   ├── application.yml       # 核心配置文件
+│   ├── application-dev.yml   # 开发环境配置
+│   └── mapper/               # MyBatis XML映射文件（可选）
+└── pom.xml
+4.2 Maven依赖（pom.xml关键部分）
+xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>2.7.14</version>
+</parent>
+
+<dependencies>
+    <!-- Spring Boot Web -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <!-- MyBatis-Plus -->
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-boot-starter</artifactId>
+        <version>3.5.3</version>
+    </dependency>
+    <!-- MySQL驱动 -->
+    <dependency>
+        <groupId>mysql</groupId>
+        <artifactId>mysql-connector-java</artifactId>
+        <version>8.0.33</version>
+    </dependency>
+    <!-- Spring Security -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <!-- JWT -->
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt</artifactId>
+        <version>0.9.1</version>
+    </dependency>
+    <!-- Redis -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <!-- 邮件 -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-mail</artifactId>
+    </dependency>
+    <!-- 定时任务（内置Quartz，无需额外依赖，若用@Scheduled） -->
+    <!-- 验证码（可选） -->
+    <dependency>
+        <groupId>com.github.penggle</groupId>
+        <artifactId>kaptcha</artifactId>
+        <version>2.3.2</version>
+    </dependency>
+    <!-- Lombok -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+4.3 配置文件 application.yml
+yaml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/course_selection?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  redis:
+    host: localhost
+    port: 6379
+    database: 0
+    timeout: 5000ms
+
+  mail:
+    host: smtp.qq.com
+    port: 587
+    username: your-email@qq.com
+    password: your-auth-code   # 授权码
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.edu.course.entity
+  global-config:
+    db-config:
+      id-type: auto
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+jwt:
+  secret: mySecretKeyForJwtTokenGeneration2025!@#
+  expiration: 86400000   # 24小时
+
+server:
+  port: 8080
+5. 公共模块实现
+5.1 统一返回结果类 Result
+java
+package com.edu.course.common;
+
+import lombok.Data;
+
+@Data
+public class Result<T> {
+    private Integer code;
+    private String message;
+    private T data;
+
+    private Result(Integer code, String message, T data) {
+        this.code = code;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static <T> Result<T> success(T data) {
+        return new Result<>(200, "success", data);
+    }
+
+    public static <T> Result<T> success() {
+        return success(null);
+    }
+
+    public static <T> Result<T> error(String message) {
+        return new Result<>(500, message, null);
+    }
+
+    public static <T> Result<T> error(Integer code, String message) {
+        return new Result<>(code, message, null);
+    }
+}
+5.2 全局异常处理
+java
+package com.edu.course.common;
+
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(Exception.class)
+    public Result<?> handleException(Exception e) {
+        e.printStackTrace();
+        return Result.error(e.getMessage());
+    }
+
+    // 自定义业务异常
+    @ExceptionHandler(BusinessException.class)
+    public Result<?> handleBusinessException(BusinessException e) {
+        return Result.error(e.getCode(), e.getMessage());
+    }
+}
+
+// 业务异常类
+public class BusinessException extends RuntimeException {
+    private Integer code;
+    public BusinessException(String message) {
+        super(message);
+        this.code = 500;
+    }
+    public BusinessException(Integer code, String message) {
+        super(message);
+        this.code = code;
+    }
+    // getter...
+}
+5.3 JWT工具类
+java
+package com.edu.course.util;
+
+import io.jsonwebtoken.*;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Component
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private Long expiration;
+
+    // 生成token，存放用户id和角色
+    public String generateToken(Integer userId, String role) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("userId", userId);
+        claims.put("role", role);
+        return Jwts.builder()
+                .setClaims(claims)
+                .setExpiration(new Date(System.currentTimeMillis() + expiration))
+                .signWith(SignatureAlgorithm.HS512, secret)
+                .compact();
+    }
+
+    // 解析token获取userId
+    public Integer getUserIdFromToken(String token) {
+        Claims claims = Jwts.parser().setSigningKey(secret).parseClaimsJws(token).getBody();
+        return (Integer) claims.get("userId");
+    }
+
+    public String getRoleFromToken(String token) {
+        Claims claims = Jwts.parser().setSigningKey(secret).parseClaimsJws(token).getBody();
+        return (String) claims.get("role");
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parser().setSigningKey(secret).parseClaimsJws(token);
+            return true;
+        } catch (JwtException e) {
+            log.error("JWT验证失败: {}", e.getMessage());
+            return false;
+        }
+    }
+}
+6. 安全框架整合（Spring Security + JWT）
+6.1 自定义UserDetailsService
+java
+package com.edu.course.security;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.edu.course.entity.User;
+import com.edu.course.mapper.UserMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+
+@Service
+public class CustomUserDetailsService implements UserDetailsService {
+
+    @Autowired
+    private UserMapper userMapper;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(User::getUsername, username);
+        User user = userMapper.selectOne(wrapper);
+        if (user == null || user.getDisabled() == 1) {
+            throw new UsernameNotFoundException("用户不存在或已被禁用");
+        }
+        // 角色映射：0-admin,1-teacher,2-student
+        String roleCode = user.getRole() == 0 ? "ROLE_ADMIN" : (user.getRole() == 1 ? "ROLE_TEACHER" : "ROLE_STUDENT");
+        return new org.springframework.security.core.userdetails.User(
+                user.getUsername(),
+                user.getPassword(),
+                Collections.singletonList(new SimpleGrantedAuthority(roleCode))
+        );
+    }
+}
+6.2 JWT认证过滤器
+java
+package com.edu.course.security;
+
+import com.edu.course.util.JwtUtil;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CustomUserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) throws ServletException, IOException {
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String username = jwtUtil.getUsernameFromToken(token); // 需扩展getUsername
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+                UsernamePasswordAuthenticationToken authentication =
+                        new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+6.3 Security配置类
+java
+package com.edu.course.config;
+
+import com.edu.course.security.JwtAuthenticationFilter;
+import com.edu.course.security.CustomUserDetailsService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Autowired
+    private CustomUserDetailsService userDetailsService;
+
+    @Autowired
+    private JwtAuthenticationFilter jwtFilter;
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(HttpSecurity http) throws Exception {
+        return http.getSharedObject(AuthenticationManagerBuilder.class)
+                .userDetailsService(userDetailsService)
+                .passwordEncoder(passwordEncoder())
+                .and()
+                .build();
+    }
+
+    protected void configure(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .authorizeRequests()
+                .antMatchers("/api/auth/**", "/api/public/**").permitAll()
+                .antMatchers("/api/admin/**").hasRole("ADMIN")
+                .antMatchers("/api/teacher/**").hasRole("TEACHER")
+                .antMatchers("/api/student/**").hasRole("STUDENT")
+                .anyRequest().authenticated()
+            .and()
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+    }
+}
+6.4 登录认证Controller
+java
+package com.edu.course.controller;
+
+import com.edu.course.common.Result;
+import com.edu.course.dto.LoginRequest;
+import com.edu.course.util.JwtUtil;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+
+    @Autowired
+    private AuthenticationManager authenticationManager;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @PostMapping("/login")
+    public Result<String> login(@RequestBody LoginRequest request) {
+        Authentication authentication = authenticationManager.authenticate(
+                new UsernamePasswordAuthenticationToken(request.getUsername(), request.getPassword())
+        );
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+        // 获取角色和用户id，生成token
+        String role = authentication.getAuthorities().iterator().next().getAuthority().replace("ROLE_", "");
+        Integer userId = userService.getUserIdByUsername(request.getUsername()); // 需实现
+        String token = jwtUtil.generateToken(userId, role);
+        return Result.success(token);
+    }
+}
+7. 缓存整合（Redis）
+7.1 配置RedisTemplate
+java
+package com.edu.course.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
+        return template;
+    }
+}
+7.2 使用Spring Cache注解
+在Service方法上使用@Cacheable、@CacheEvict等。
+
+java
+@Service
+public class CourseService {
+
+    @Autowired
+    private CourseMapper courseMapper;
+
+    // 查询单个课程时缓存
+    @Cacheable(value = "course", key = "#id")
+    public Course getById(Integer id) {
+        return courseMapper.selectById(id);
+    }
+
+    // 更新课程后清除缓存
+    @CacheEvict(value = "course", key = "#course.id")
+    public void updateCourse(Course course) {
+        courseMapper.updateById(course);
+    }
+}
+在启动类添加@EnableCaching。
+
+8. 定时任务整合（Quartz）
+使用Spring内置的@Scheduled实现任务调度。
+
+java
+package com.edu.course.task;
+
+import com.edu.course.service.CourseService;
+import com.edu.course.service.MailService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+@EnableScheduling
+public class CourseTask {
+
+    @Autowired
+    private CourseService courseService;
+
+    @Autowired
+    private MailService mailService;
+
+    // 每天凌晨1点执行：检查满员课程，发送预警邮件给相应教师
+    @Scheduled(cron = "0 0 1 * * ?")
+    public void checkFullCourses() {
+        List<Course> fullCourses = courseService.getFullCourses(); // 查询 selected >= capacity
+        for (Course course : fullCourses) {
+            String teacherEmail = course.getTeacherEmail();
+            String subject = "课程【" + course.getName() + "】已满员预警";
+            String content = "您的课程已选满，请及时处理。";
+            mailService.sendSimpleMail(teacherEmail, subject, content);
+        }
+    }
+}
+9. 邮件服务整合（JavaMail）
+java
+package com.edu.course.service;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+
+@Service
+public class MailService {
+
+    @Autowired
+    private JavaMailSender mailSender;
+
+    @Value("${spring.mail.username}")
+    private String from;
+
+    public void sendSimpleMail(String to, String subject, String content) {
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom(from);
+        message.setTo(to);
+        message.setSubject(subject);
+        message.setText(content);
+        mailSender.send(message);
+    }
+}
+选课成功后调用发送邮件：
+
+java
+// 在选课Service中
+mailService.sendSimpleMail(studentEmail, "选课成功", "您已成功选择课程：" + courseName);
+10. 管理员模块实现
+10.1 菜单管理
+实体 Menu.java
+
+java
+@Data
+@TableName("menu")
+public class Menu {
+    @TableId(type = IdType.AUTO)
+    private Integer id;
+    private String name;
+    private String path;
+    private String permission;
+    private Integer parentId;
+    private Integer sort;
+    private Integer disabled;
+}
+Mapper MenuMapper.java
+
+java
+@Mapper
+public interface MenuMapper extends BaseMapper<Menu> {
+}
+Service MenuService.java
+
+java
+@Service
+public class MenuService {
+    @Autowired
+    private MenuMapper menuMapper;
+
+    public List<Menu> getMenuTree() {
+        // 递归查询菜单树
+    }
+
+    @CacheEvict(value = "menu", allEntries = true)
+    public void addMenu(Menu menu) {
+        menuMapper.insert(menu);
+    }
+
+    @CacheEvict(value = "menu", allEntries = true)
+    public void toggleDisabled(Integer id, Integer disabled) {
+        Menu menu = menuMapper.selectById(id);
+        if (menu != null) {
+            menu.setDisabled(disabled);
+            menuMapper.updateById(menu);
+        }
+    }
+}
+AdminController.java 中的菜单管理接口
+
+java
+@RestController
+@RequestMapping("/api/admin/menu")
+@PreAuthorize("hasRole('ADMIN')")
+public class AdminController {
+
+    @Autowired
+    private MenuService menuService;
+
+    @PostMapping("/add")
+    public Result<?> addMenu(@RequestBody Menu menu) {
+        menuService.addMenu(menu);
+        return Result.success();
+    }
+
+    @PutMapping("/disable/{id}")
+    public Result<?> disableMenu(@PathVariable Integer id) {
+        menuService.toggleDisabled(id, 1);
+        return Result.success();
+    }
+}
+10.2 公告管理（教务管理）
+实体 Notice.java
+
+java
+@Data
+@TableName("notice")
+public class Notice {
+    @TableId(type = IdType.AUTO)
+    private Integer id;
+    private String title;
+    private String content;
+    private Date createTime;
+    private Date updateTime;
+}
+Service NoticeService.java
+
+java
+@Service
+public class NoticeService {
+    @Autowired
+    private NoticeMapper noticeMapper;
+
+    @Cacheable(value = "noticeList")
+    public List<Notice> getAllNotices() {
+        return noticeMapper.selectList(null);
+    }
+
+    @CacheEvict(value = "noticeList", allEntries = true)
+    public void addNotice(Notice notice) {
+        notice.setCreateTime(new Date());
+        noticeMapper.insert(notice);
+    }
+
+    @CacheEvict(value = "noticeList", allEntries = true)
+    public void updateNotice(Notice notice) {
+        noticeMapper.updateById(notice);
+    }
+
+    public Notice getNoticeDetail(Integer id) {
+        return noticeMapper.selectById(id);
+    }
+}
+Controller
+
+java
+@GetMapping("/notices")
+public Result<List<Notice>> listNotices() {
+    return Result.success(noticeService.getAllNotices());
+}
+
+@PostMapping("/notice/add")
+public Result<?> addNotice(@RequestBody Notice notice) {
+    noticeService.addNotice(notice);
+    return Result.success();
+}
+
+@PutMapping("/notice/update")
+public Result<?> updateNotice(@RequestBody Notice notice) {
+    noticeService.updateNotice(notice);
+    return Result.success();
+}
+10.3 教师管理（人员管理）
+Service 提供教师查询、禁用操作
+
+java
+// UserService
+public List<User> getTeachers() {
+    LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+    wrapper.eq(User::getRole, 1); // 角色为教师
+    return userMapper.selectList(wrapper);
+}
+
+public void disableUser(Integer userId, Integer disabled) {
+    User user = userMapper.selectById(userId);
+    if (user != null) {
+        user.setDisabled(disabled);
+        userMapper.updateById(user);
+    }
+}
+Controller
+
+java
+@GetMapping("/teachers")
+public Result<List<User>> listTeachers() {
+    return Result.success(userService.getTeachers());
+}
+
+@PutMapping("/user/disable/{userId}")
+public Result<?> disableTeacher(@PathVariable Integer userId, @RequestParam Integer disabled) {
+    userService.disableUser(userId, disabled);
+    return Result.success();
+}
+10.4 角色权限管理（角色与菜单绑定）
+实现思路：提供角色列表查询、为角色分配菜单（通过role_menu表）。由于篇幅，仅列出关键代码。
+
+java
+// RoleService
+public void assignMenusToRole(Integer roleId, List<Integer> menuIds) {
+    // 先删除旧关联，再插入新关联
+    roleMenuMapper.delete(new LambdaQueryWrapper<RoleMenu>().eq(RoleMenu::getRoleId, roleId));
+    for (Integer menuId : menuIds) {
+        RoleMenu rm = new RoleMenu(roleId, menuId);
+        roleMenuMapper.insert(rm);
+    }
+}
+11. 教师模块实现
+11.1 课程查看
+教师登录后只能看到自己教授的课程。
+
+java
+// CourseService
+public List<Course> getCoursesByTeacher(Integer teacherId) {
+    LambdaQueryWrapper<Course> wrapper = new LambdaQueryWrapper<>();
+    wrapper.eq(Course::getTeacherId, teacherId);
+    return courseMapper.selectList(wrapper);
+}
+TeacherController
+
+java
+@GetMapping("/my-courses")
+public Result<List<Course>> getMyCourses(@AuthenticationPrincipal UserDetails userDetails) {
+    // 从userDetails获取当前教师id
+    Integer teacherId = userService.getUserIdByUsername(userDetails.getUsername());
+    return Result.success(courseService.getCoursesByTeacher(teacherId));
+}
+11.2 成绩录入
+按学年、课程、学生姓名查询后录入成绩。
+
+DTO
+
+java
+@Data
+public class ScoreUpdateDTO {
+    private Integer selectionId; // 选课记录ID
+    private Float score;
+}
+Service
+
+java
+// SelectionService
+public void updateScore(Integer selectionId, Float score) {
+    Selection selection = selectionMapper.selectById(selectionId);
+    if (selection != null) {
+        selection.setScore(score);
+        selectionMapper.updateById(selection);
+    }
+}
+
+public List<Selection> getSelectionsByTermAndCourse(Integer teacherId, String term, Integer courseId, String studentName) {
+    // 多表联查：selection join user, course
+    // 使用MyBatis-Plus的selectJoin或自定义XML
+}
+Controller
+
+java
+@PutMapping("/score")
+public Result<?> updateScore(@RequestBody ScoreUpdateDTO dto) {
+    selectionService.updateScore(dto.getSelectionId(), dto.getScore());
+    return Result.success();
+}
+
+@GetMapping("/selections")
+public Result<List<SelectionVO>> querySelections(@RequestParam String term,
+                                                  @RequestParam(required=false) Integer courseId,
+                                                  @RequestParam(required=false) String studentName) {
+    // 获取当前教师id，查询符合条件的选课记录
+    List<SelectionVO> list = selectionService.getSelectionsByCondition(teacherId, term, courseId, studentName);
+    return Result.success(list);
+}
+12. 学生模块实现
+12.1 首页公告展示
+java
+// StudentController
+@GetMapping("/notices")
+@Cacheable(value = "noticeList") // 复用缓存
+public Result<List<Notice>> getNotices() {
+    return Result.success(noticeService.getAllNotices());
+}
+12.2 选课中心
+功能：展示所有已启用且未选满的课程，提供选课操作，需校验是否冲突（同一学期同一时段不能选两门课，简单实现可按时间段，此处略复杂，示例仅判断重复选课和容量）。
+
+Service
+
+java
+@Service
+public class SelectionService {
+
+    @Autowired
+    private SelectionMapper selectionMapper;
+    @Autowired
+    private CourseMapper courseMapper;
+
+    @Transactional
+    public void selectCourse(Integer studentId, Integer courseId) {
+        // 1. 检查是否已选过该课程
+        LambdaQueryWrapper<Selection> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(Selection::getStudentId, studentId).eq(Selection::getCourseId, courseId);
+        if (selectionMapper.selectCount(wrapper) > 0) {
+            throw new BusinessException("您已选过该课程");
+        }
+        // 2. 检查课程容量
+        Course course = courseMapper.selectById(courseId);
+        if (course.getSelected() >= course.getCapacity()) {
+            throw new BusinessException("课程已满员");
+        }
+        // 3. 检查学期课程时间冲突（略，可扩展）
+        // 4. 插入选课记录
+        Selection selection = new Selection();
+        selection.setStudentId(studentId);
+        selection.setCourseId(courseId);
+        selection.setSelectTime(new Date());
+        selectionMapper.insert(selection);
+        // 5. 更新课程已选人数
+        course.setSelected(course.getSelected() + 1);
+        courseMapper.updateById(course);
+        // 6. 发送邮件（异步更佳，直接调用）
+        // mailService...
+    }
+}
+Controller
+
+java
+@PostMapping("/select")
+public Result<?> selectCourse(@RequestParam Integer courseId, @AuthenticationPrincipal UserDetails userDetails) {
+    Integer studentId = userService.getUserIdByUsername(userDetails.getUsername());
+    selectionService.selectCourse(studentId, courseId);
+    return Result.success();
+}
+
+@GetMapping("/available-courses")
+public Result<List<Course>> getAvailableCourses() {
+    // 已启用 && selected < capacity && status=1
+    LambdaQueryWrapper<Course> wrapper = new LambdaQueryWrapper<>();
+    wrapper.eq(Course::getStatus, 1).apply("selected < capacity");
+    return Result.success(courseMapper.selectList(wrapper));
+}
+12.3 选课统计
+java
+@GetMapping("/my-selections")
+public Result<List<SelectionVO>> getMySelections(@AuthenticationPrincipal UserDetails userDetails) {
+    Integer studentId = userService.getUserIdByUsername(userDetails.getUsername());
+    List<SelectionVO> list = selectionService.getSelectionsByStudentId(studentId);
+    return Result.success(list);
+}
+13. 前端Vue实现
+13.1 项目初始化
+使用Vue CLI创建项目，安装Element UI、Axios、Vue Router。
+
+bash
+vue create course-selection-front
+cd course-selection-front
+npm install element-ui axios vue-router
+13.2 登录页面
+src/views/Login.vue
+
+vue
+<template>
+  <el-form :model="loginForm" label-width="80px">
+    <el-form-item label="用户名">
+      <el-input v-model="loginForm.username"></el-input>
+    </el-form-item>
+    <el-form-item label="密码">
+      <el-input type="password" v-model="loginForm.password"></el-input>
+    </el-form-item>
+    <el-button type="primary" @click="submitLogin">登录</el-button>
+  </el-form>
+</template>
+
+<script>
+import axios from '@/utils/request'; // 封装axios
+
+export default {
+  data() {
+    return {
+      loginForm: { username: '', password: '' }
+    };
+  },
+  methods: {
+    submitLogin() {
+      axios.post('/api/auth/login', this.loginForm).then(res => {
+        if (res.data.code === 200) {
+          localStorage.setItem('token', res.data.data);
+          this.$router.push('/dashboard');
+        } else {
+          this.$message.error(res.data.message);
+        }
+      });
+    }
+  }
+};
+</script>
+请求拦截器封装 src/utils/request.js
+
+javascript
+import axios from 'axios';
+
+const instance = axios.create({
+  baseURL: 'http://localhost:8080',
+  timeout: 10000
+});
+
+instance.interceptors.request.use(config => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+export default instance;
+13.3 学生选课中心页面
+src/views/student/CourseCenter.vue
+
+vue
+<template>
+  <div>
+    <el-table :data="courseList" border>
+      <el-table-column prop="name" label="课程名称"></el-table-column>
+      <el-table-column prop="credit" label="学分"></el-table-column>
+      <el-table-column label="已选/容量" width="120">
+        <template slot-scope="scope">
+          {{ scope.row.selected }} / {{ scope.row.capacity }}
+        </template>
+      </el-table-column>
+      <el-table-column label="操作">
+        <template slot-scope="scope">
+          <el-button
+            type="primary"
+            size="small"
+            :disabled="scope.row.selected >= scope.row.capacity"
+            @click="selectCourse(scope.row.id)"
+          >选课</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+</template>
+
+<script>
+import request from '@/utils/request';
+
+export default {
+  data() {
+    return {
+      courseList: []
+    };
+  },
+  created() {
+    this.fetchCourses();
+  },
+  methods: {
+    fetchCourses() {
+      request.get('/api/student/available-courses').then(res => {
+        this.courseList = res.data.data;
+      });
+    },
+    selectCourse(courseId) {
+      request.post(`/api/student/select?courseId=${courseId}`).then(res => {
+        if (res.data.code === 200) {
+          this.$message.success('选课成功');
+          this.fetchCourses(); // 刷新列表
+        } else {
+          this.$message.error(res.data.message);
+        }
+      });
+    }
+  }
+};
+</script>
+13.4 教师成绩录入页面
+src/views/teacher/ScoreEntry.vue
+
+vue
+<template>
+  <div>
+    <el-form :inline="true">
+      <el-form-item label="学期">
+        <el-input v-model="query.term" placeholder="如2025-2026-1"></el-input>
+      </el-form-item>
+      <el-form-item label="课程">
+        <el-select v-model="query.courseId">
+          <el-option v-for="c in myCourses" :key="c.id" :label="c.name" :value="c.id"></el-option>
+        </el-select>
+      </el-form-item>
+      <el-form-item label="学生姓名">
+        <el-input v-model="query.studentName"></el-input>
+      </el-form-item>
+      <el-button @click="search">查询</el-button>
+    </el-form>
+    <el-table :data="selectionList" border>
+      <el-table-column prop="studentName" label="学生姓名"></el-table-column>
+      <el-table-column prop="courseName" label="课程名称"></el-table-column>
+      <el-table-column label="成绩">
+        <template slot-scope="scope">
+          <el-input-number v-model="scope.row.score" :min="0" :max="100"></el-input-number>
+          <el-button @click="saveScore(scope.row)">保存</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+</template>
+
+<script>
+export default {
+  data() {
+    return {
+      query: { term: '', courseId: null, studentName: '' },
+      myCourses: [],
+      selectionList: []
+    };
+  },
+  created() {
+    this.getMyCourses();
+  },
+  methods: {
+    getMyCourses() {
+      request.get('/api/teacher/my-courses').then(res => {
+        this.myCourses = res.data.data;
+      });
+    },
+    search() {
+      request.get('/api/teacher/selections', { params: this.query }).then(res => {
+        this.selectionList = res.data.data;
+      });
+    },
+    saveScore(row) {
+      request.put('/api/teacher/score', { selectionId: row.id, score: row.score }).then(res => {
+        this.$message.success('成绩保存成功');
+      });
+    }
+  }
+};
+</script>
+13.5 管理员后台页面（公告管理示例）
+src/views/admin/NoticeManage.vue
+
+vue
+<template>
+  <div>
+    <el-button @click="dialogVisible=true">新增公告</el-button>
+    <el-table :data="notices">
+      <el-table-column prop="title" label="标题"></el-table-column>
+      <el-table-column prop="content" label="内容" show-overflow-tooltip></el-table-column>
+      <el-table-column prop="createTime" label="发布时间"></el-table-column>
+      <el-table-column label="操作">
+        <template slot-scope="scope">
+          <el-button @click="editNotice(scope.row)">编辑</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+    <el-dialog title="公告编辑" :visible.sync="dialogVisible">
+      <el-form :model="currentNotice">
+        <el-form-item label="标题"><el-input v-model="currentNotice.title"></el-input></el-form-item>
+        <el-form-item label="内容"><el-input type="textarea" v-model="currentNotice.content"></el-input></el-form-item>
+      </el-form>
+      <span slot="footer">
+        <el-button @click="saveNotice">保存</el-button>
+      </span>
+    </el-dialog>
+  </div>
+</template>
+
+<script>
+export default {
+  data() {
+    return {
+      notices: [],
+      currentNotice: { id: null, title: '', content: '' },
+      dialogVisible: false
+    };
+  },
+  created() {
+    this.loadNotices();
+  },
+  methods: {
+    loadNotices() {
+      request.get('/api/admin/notices').then(res => {
+        this.notices = res.data.data;
+      });
+    },
+    saveNotice() {
+      if (this.currentNotice.id) {
+        request.put('/api/admin/notice/update', this.currentNotice).then(() => {
+          this.$message.success('更新成功');
+          this.loadNotices();
+          this.dialogVisible = false;
+        });
+      } else {
+        request.post('/api/admin/notice/add', this.currentNotice).then(() => {
+          this.$message.success('添加成功');
+          this.loadNotices();
+          this.dialogVisible = false;
+        });
+      }
+    },
+    editNotice(row) {
+      this.currentNotice = { ...row };
+      this.dialogVisible = true;
+    }
+  }
+};
+</script>
+14. 部署与测试
+14.1 后端打包与运行
+bash
+mvn clean package
+java -jar target/course-selection-0.0.1-SNAPSHOT.jar
+14.2 前端打包与部署
+bash
+npm run build
+# 将dist目录内容放置到nginx或SpringBoot的static目录
+14.3 测试用例表
+测试功能	操作	预期结果
+学生选课	学生登录，选择一门未满课程	选课成功，课程已选人数+1，收到邮件
+选课冲突	选择已选过的课程	提示“您已选过该课程”
+教师录入成绩	教师查询到学生，输入分数保存	成绩更新成功，学生端可见
+管理员禁用教师	管理员将教师状态设为禁用	该教师无法登录
+公告缓存	管理员修改公告后，学生端立即显示新内容	缓存失效，更新生效
+15. 课程设计评分对应说明
+评分点	实现情况	文档对应章节
+搭建项目服务	SpringBoot工程结构完整	第4章
+工程测试	MyBatis接口测试通过	第14章测试用例
+Vue前端	使用Element UI + Axios	第13章
+管理员模块	菜单、教务、人员、角色管理	第10章
+首页数据展示	公告从数据库展示	12.1
+人员管理	教师查询/禁用	10.3
+课程管理	管理员增删改查课程（可扩展）	补充实现即可
+编码规范	遵循规范，类和方法注释	全部代码
+项目整体	可部署运行，业务正常	第14章
+项目创新	邮件通知、Redis缓存、定时任务	第7,8,9章
+课程设计报告	本文档即为报告	-
+项目答辩	准备PPT演示	另行准备

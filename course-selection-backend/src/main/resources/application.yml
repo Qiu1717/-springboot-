@@ -1,0 +1,105 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/course_selection?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    database: 0
+    timeout: 5000ms
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+
+  mail:
+    host: ${MAIL_HOST:smtp.qq.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
+  # 允许循环依赖
+  main:
+    allow-circular-references: true
+
+  # 使用 Redis 缓存
+  cache:
+    type: redis
+
+  # RabbitMQ 消息队列（教师忘记密码时异步发邮件给管理员）
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: /
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+    listener:
+      simple:
+        acknowledge-mode: manual
+        concurrency: 3
+        max-concurrency: 10
+        prefetch: 1
+
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.edu.course.entity
+  global-config:
+    db-config:
+      id-type: auto
+  configuration:
+    map-underscore-to-camel-case: true
+
+jwt:
+  # 生产环境务必通过环境变量 JWT_SECRET 覆盖
+  secret: ${JWT_SECRET:course-selection-system-jwt-secret-please-override-in-production}
+  expiration: 86400000   # 24小时，单位毫秒
+
+server:
+  port: ${SERVER_PORT:8080}
+
+# 文件上传配置（改为相对路径，避免写死本机绝对路径）
+file:
+  upload-dir: ${FILE_UPLOAD_DIR:./uploads}
+  download-dir: ${FILE_DOWNLOAD_DIR:./downloads}
+  max-size: 100MB
+
+# 接收教师密码重置申请的管理员邮箱
+mail:
+  admin-email: ${MAIL_ADMIN_EMAIL:admin@example.com}
+
+# AI 配置（DeepSeek），不配置则 AI 对话功能不可用
+ai:
+  deepseek:
+    api-url: ${DEEPSEEK_API_URL:https://api.deepseek.com}
+    api-key: ${DEEPSEEK_API_KEY:}
+
+# 日志级别
+logging:
+  level:
+    root: INFO
+    com.edu.course: INFO
+    # 需要排查 SQL / 缓存问题时，把下面几行改为 DEBUG
+    # com.edu.course.mapper: DEBUG
+    # org.springframework.data.redis: DEBUG
+    # org.springframework.cache: DEBUG

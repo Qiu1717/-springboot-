@@ -1,0 +1,1144 @@
+# 学生选课系统流程说明
+
+## 文档信息
+- **项目名称**：学生选课管理系统
+- **文档版本**：v2.0
+- **创建日期**：2026-07-02
+- **技术栈**：Spring Boot 2.7 + Vue 2 + MyBatis-Plus + Redis + RabbitMQ + DeepSeek AI
+
+---
+
+## 目录
+
+1. [系统概述与技术架构](#系统概述与技术架构)
+2. [模块一：学生选课流程（含6步校验详解）](#模块一学生选课流程)
+3. [模块二：成绩录入流程](#模块二成绩录入流程)
+4. [模块三：AI智能助手流程](#模块三ai智能助手流程)
+5. [通用：关键技术点总结](#通用关键技术点总结)
+
+---
+
+## 系统概述与技术架构
+
+### 系统三大核心模块
+
+本系统由三大核心业务模块构成，每个模块均有完整的前端到数据库链路：
+
+| 模块 | 入口端 | 核心链路 | 涉及技术 |
+|------|--------|----------|----------|
+| 学生选课 | 学生端 | StudentController → SelectionService → SelectionMapper | 事务+缓存+MQ |
+| 成绩录入 | 教师端 | TeacherController → SelectionService → SelectionMapper | 缓存+权限隔离 |
+| AI智能助手 | 全端 | AIController → AIService → DeepSeek API | RestTemplate+数据注入 |
+
+### 技术架构图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      前端 Vue 2 + Element UI                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │ CourseCenter │  │ ScoreDetail  │  │   AIChat     │       │
+│  │   选课中心   │  │  成绩录入    │  │  AI 助手窗   │       │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+└─────────┼─────────────────┼─────────────────┼──────────────┘
+          │ /api/student/*  │ /api/teacher/*  │ /api/ai/*
+          ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Spring Boot 控制层 (Controller)                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │StudentCtrl   │  │TeacherCtrl   │  │  AIController│       │
+│  │@PreAuthorize │  │@PreAuthorize │  │  JWT解析UID  │       │
+│  │ ROLE_STUDENT │  │ROLE_TEACHER  │  │              │       │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+└─────────┼─────────────────┼─────────────────┼──────────────┘
+          ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│              业务层 (Service)                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │SelectionSvc  │  │SelectionSvc  │  │  AIService   │       │
+│  │6步校验+事务  │  │ updateScore  │  │按角色注入数据│       │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+└─────────┼─────────────────┼─────────────────┼──────────────┘
+          ▼                 ▼                 ▼
+┌──────────────────┐  ┌─────────────┐  ┌────────────────────┐
+│  Mapper层        │  │   MySQL     │  │  DeepSeek API      │
+│ SelectionMapper  │  │ selection表 │  │ /v1/chat/completions│
+│ CourseMapper     │  │ course表    │  │ RestTemplate调用    │
+│ UserMapper       │  │ user表      │  │                     │
+└──────────────────┘  └─────────────┘  └────────────────────┘
+          │
+          ▼
+┌──────────────────┐  ┌────────────────────┐
+│  Redis 缓存      │  │   RabbitMQ 消息    │
+│ mySelections::   │  │  mail.queue 异步   │
+│ availableCourses │  │  邮件通知          │
+└──────────────────┘  └────────────────────┘
+```
+
+### 数据表说明
+
+```sql
+-- 用户表（role: 0管理员 / 1教师 / 2学生）
+CREATE TABLE user (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) UNIQUE,
+    password VARCHAR(100),
+    real_name VARCHAR(50),
+    email VARCHAR(100),
+    role INT  -- 0管理员 1教师 2学生
+);
+
+-- 课程表
+CREATE TABLE course (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100),
+    credit FLOAT,
+    term VARCHAR(20),
+    schedule VARCHAR(100),  -- 如"周一 1-2节 机房A101"
+    teacher_id INT,
+    selected INT DEFAULT 0,  -- 已选人数
+    capacity INT,            -- 容量上限
+    status INT DEFAULT 1     -- 1启用 0停用
+);
+
+-- 选课记录表（含成绩）
+CREATE TABLE selection (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    student_id INT,
+    course_id INT,
+    score FLOAT DEFAULT NULL,  -- NULL=未出分
+    select_time DATETIME,
+    UNIQUE KEY uk_student_course (student_id, course_id)  -- 防重复选课
+);
+```
+
+---
+
+## 模块一：学生选课流程
+
+### 1.1 模块概述
+
+| 项目 | 说明 |
+|------|------|
+| **入口端** | 学生端 |
+| **接口路径** | `POST /api/student/select?courseId=123` |
+| **权限要求** | `ROLE_STUDENT`（类级 `@PreAuthorize`） |
+| **核心类** | StudentController → SelectionService → SelectionMapper |
+| **事务保障** | `@Transactional` 保证原子性 |
+| **缓存策略** | `@CacheEvict(value="mySelections", key="#studentId")` |
+| **异步通知** | RabbitMQ 发送选课成功邮件 |
+
+### 1.2 完整调用链路
+
+```
+① 前端 POST /api/student/select?courseId=123（携带 JWT Token）
+② JwtAuthenticationFilter 解析 Token → SecurityContext 设置认证信息
+③ StudentController @PreAuthorize 校验 STUDENT 角色
+④ @AuthenticationPrincipal 获取当前学生 → username 转 studentId
+⑤ SelectionService.selectCourse() @Transactional 事务内执行 6 步校验
+⑥ 插入 selection 表 + 更新 course.selected
+⑦ @CacheEvict 清除 mySelections 缓存
+⑧ RabbitMQ 异步发送选课成功邮件
+⑨ 返回 Result.success() 给前端
+```
+
+### 1.3 前端发起请求
+
+```javascript
+// CourseCenter.vue 选课中心
+async handleSelect(course) {
+  const res = await request.post('/api/student/select', null, {
+    params: { courseId: course.id },  // 通过 query 参数传 courseId
+    headers: { 'Authorization': 'Bearer ' + token }  // JWT Token
+  });
+  if (res.code === 200) {
+    this.$message.success('选课成功！');
+    this.loadCourses();  // 刷新可选课程列表
+  }
+}
+```
+
+### 1.4 Controller 层
+
+```java
+// StudentController.java
+@RestController
+@RequestMapping("/api/student")
+@PreAuthorize("hasRole('STUDENT')")  // 类级别：所有方法都需要学生角色
+public class StudentController {
+
+    @Autowired private SelectionService selectionService;
+    @Autowired private UserService userService;
+
+    /**
+     * 选课 — 核心业务入口
+     * @AuthenticationPrincipal: Spring Security 自动注入当前登录用户
+     */
+    @PostMapping("/select")
+    public Result<?> selectCourse(@RequestParam Integer courseId,
+                                   @AuthenticationPrincipal UserDetails userDetails) {
+        // username → studentId 转换
+        Integer studentId = userService.getUserIdByUsername(userDetails.getUsername());
+        // 6步校验 + 事务操作
+        selectionService.selectCourse(studentId, courseId);
+        return Result.success();
+    }
+}
+```
+
+### 1.5 ⭐ 选课6步校验详解（核心）
+
+`SelectionService.selectCourse()` 方法标注 `@Transactional`，保证以下6步操作要么全部成功，要么全部回滚。任一步骤失败都会抛出 `BusinessException`，触发事务回滚。
+
+#### 第1步：检查重复选课
+
+**目的**：防止同一学生重复选择同一门课程。
+
+```java
+// ① 检查重复选课: 同一个学生+同一门课只能有一条记录
+LambdaQueryWrapper<Selection> wrapper = new LambdaQueryWrapper<>();
+wrapper.eq(Selection::getStudentId, studentId)  // WHERE student_id = ?
+       .eq(Selection::getCourseId, courseId);   // AND course_id = ?
+if (selectionMapper.selectCount(wrapper) > 0) {
+    throw new BusinessException("您已选过该课程");  // 抛异常 → 事务回滚
+}
+```
+
+**说明**：
+- 使用 MyBatis-Plus 的 `LambdaQueryWrapper` 构造查询条件
+- `selectCount` 执行 `COUNT(*)` 查询，比 `selectOne` 性能更好
+- 数据库层有 `uk_student_course` 唯一索引做双重保障
+
+#### 第2步：检查选课数量上限
+
+**目的**：限制每个学生最多选5门课。
+
+```java
+// ② 检查选课数量上限: 每个学生最多选5门课
+LambdaQueryWrapper<Selection> countWrapper = new LambdaQueryWrapper<>();
+countWrapper.eq(Selection::getStudentId, studentId);
+long selectedCount = selectionMapper.selectCount(countWrapper);
+if (selectedCount >= 5) {
+    throw new BusinessException("选课已达上限（最多5门），请先退课再选");
+}
+```
+
+**说明**：
+- 统计该学生已有的选课记录数
+- 上限为5门，超过则拒绝选课
+- 引导学生先退课再选新课
+
+#### 第3步：检查课程存在且启用
+
+**目的**：确保选的是有效课程（存在且状态为启用）。
+
+```java
+// ③ 检查课程是否存在且启用(status=1)
+Course course = courseMapper.selectById(courseId);
+if (course == null || course.getStatus() == 0) {
+    throw new BusinessException("课程不存在或已停用");
+}
+```
+
+**说明**：
+- `course.getStatus() == 0` 表示课程已停用
+- 防止学生选到已被管理员下架的课程
+- 同时获取 Course 对象，后续步骤需要使用
+
+#### 第4步：检查上课时间冲突
+
+**目的**：防止学生选到时间冲突的课程。
+
+```java
+// ④ 检查上课时间冲突: 遍历已选课程，比较 schedule 字段是否相同
+List<SelectionVO> mySelections = selectionMapper.selectByStudentId(studentId);
+for (SelectionVO s : mySelections) {
+    Course existingCourse = courseMapper.selectById(s.getCourseId());
+    if (existingCourse != null && existingCourse.getSchedule() != null
+            && course.getSchedule() != null
+            && existingCourse.getSchedule().equals(course.getSchedule())) {
+        throw new BusinessException("上课时间冲突！您已选课程「"
+                + existingCourse.getName() + "」占用了同一时段：" + course.getSchedule());
+    }
+}
+```
+
+**说明**：
+- 查询学生已选的所有课程（连表查询，含课程信息）
+- 逐个比较 `schedule` 字段（如 "周一 1-2节 机房A101"）
+- 字符串完全相同即判定为时间冲突
+- 错误信息会提示冲突的课程名和时段
+
+#### 第5步：检查课程容量
+
+**目的**：确保课程未满员。
+
+```java
+// ⑤ 检查课程容量: selected < capacity 才可继续选
+if (course.getSelected() >= course.getCapacity()) {
+    throw new BusinessException("课程已满员");
+}
+```
+
+**说明**：
+- `selected` 为已选人数，`capacity` 为容量上限
+- 注意：此处未加锁，高并发下可能超卖（生产环境应加乐观锁）
+- 校验通过后进入第6步执行写操作
+
+#### 第6步：执行选课操作
+
+**目的**：插入选课记录 + 更新课程人数 + 异步邮件通知。
+
+```java
+// ⑥ 插入选课记录(无成绩，score=null)
+Selection selection = new Selection();
+selection.setStudentId(studentId);
+selection.setCourseId(courseId);
+selection.setSelectTime(new Date());  // 当前时间
+selectionMapper.insert(selection);  // INSERT INTO selection ...
+
+// 更新课程已选人数(selected+1)
+course.setSelected(course.getSelected() + 1);
+courseMapper.updateById(course);  // UPDATE course SET selected=...
+
+// 通过 RabbitMQ 异步发送邮件通知（不阻塞接口响应）
+User student = userMapper.selectById(studentId);
+if (student != null && student.getEmail() != null && !student.getEmail().isEmpty()) {
+    mailProducer.sendMail(
+        student.getEmail(),
+        "选课成功通知",
+        "同学您好！您已成功选择课程：「" + course.getName() + "」，"
+                + "学分：" + course.getCredit() + "，"
+                + "学期：" + course.getTerm() + "。请按时上课！"
+    );
+}
+```
+
+**说明**：
+- 插入 `selection` 记录，此时 `score = null`（未出分）
+- 更新 `course.selected` 加1
+- 通过 RabbitMQ 异步发邮件，不阻塞主线程
+- 整个方法在 `@Transactional` 内，任一步异常全部回滚
+
+### 1.6 6步校验流程图
+
+```
+学生发起选课 (courseId=123)
+        │
+        ▼
+┌───────────────────┐
+│ 第1步：重复选课检查 │──是──▶ 抛异常"您已选过该课程" (回滚)
+│ COUNT(student+course)│
+└─────────┬─────────┘
+          │ 否
+          ▼
+┌───────────────────┐
+│ 第2步：选课上限检查 │──是──▶ 抛异常"选课已达上限(最多5门)" (回滚)
+│ COUNT(student) >= 5│
+└─────────┬─────────┘
+          │ 否
+          ▼
+┌───────────────────┐
+│ 第3步：课程状态检查 │──是──▶ 抛异常"课程不存在或已停用" (回滚)
+│ course==null||status=0│
+└─────────┬─────────┘
+          │ 否
+          ▼
+┌───────────────────┐
+│ 第4步：时间冲突检查 │──是──▶ 抛异常"上课时间冲突！" (回滚)
+│ schedule 字符串比较 │
+└─────────┬─────────┘
+          │ 否
+          ▼
+┌───────────────────┐
+│ 第5步：容量上限检查 │──是──▶ 抛异常"课程已满员" (回滚)
+│ selected >= capacity│
+└─────────┬─────────┘
+          │ 否
+          ▼
+┌───────────────────┐
+│ 第6步：执行选课操作 │
+│ INSERT selection   │
+│ UPDATE course+1    │
+│ MQ 异步邮件通知    │
+└─────────┬─────────┘
+          │
+          ▼
+    选课成功 ✅
+    返回 Result.success()
+```
+
+### 1.7 数据库操作（Mapper层）
+
+```java
+// SelectionMapper.java — 继承 BaseMapper 自带 CRUD
+@Mapper
+public interface SelectionMapper extends BaseMapper<Selection> {
+
+    // 学生端：查看自己的选课记录（3表连表查询）
+    @Select("SELECT s.id, s.student_id, s.course_id, s.score, s.select_time, " +
+            "c.name AS course_name, c.credit, c.term, " +
+            "u.real_name AS student_name " +
+            "FROM selection s " +
+            "LEFT JOIN course c ON s.course_id = c.id " +
+            "LEFT JOIN user u ON s.student_id = u.id " +
+            "WHERE s.student_id = #{studentId}")
+    List<SelectionVO> selectByStudentId(@Param("studentId") Integer studentId);
+}
+```
+
+### 1.8 退课流程（关联操作）
+
+```java
+@Transactional
+@CacheEvict(value = "mySelections", key = "#studentId")
+public void dropCourse(Integer studentId, Integer courseId) {
+    // 查询选课记录
+    Selection selection = selectionMapper.selectOne(...);
+    if (selection == null) throw new BusinessException("未找到该选课记录");
+    // 已有成绩不能退
+    if (selection.getScore() != null) throw new BusinessException("已有成绩，无法退课");
+    // 物理删除记录
+    selectionMapper.deleteById(selection.getId());
+    // 恢复课程人数
+    Course course = courseMapper.selectById(courseId);
+    if (course != null && course.getSelected() > 0) {
+        course.setSelected(course.getSelected() - 1);
+        courseMapper.updateById(course);
+    }
+}
+```
+
+---
+
+## 模块二：成绩录入流程
+
+### 2.1 模块概述
+
+| 项目 | 说明 |
+|------|------|
+| **入口端** | 教师端 |
+| **接口路径** | `PUT /api/teacher/score`（单条）/ `PUT /api/teacher/score/batch`（批量） |
+| **权限要求** | `ROLE_TEACHER` 或 `ROLE_ADMIN` |
+| **核心类** | TeacherController → SelectionService.updateScore → SelectionMapper |
+| **数据隔离** | 教师只能查看/录入自己教授课程的成绩（`teacher_id` 隔离） |
+| **缓存策略** | 更新成绩后清除 `mySelections` 缓存 |
+
+### 2.2 完整调用链路
+
+```
+① 教师在 ScoreEntry.vue 选择课程 → 跳转 ScoreDetail.vue
+② GET /api/teacher/selections 拉取该课程的学生选课记录（teacher_id 隔离）
+③ 教师输入成绩 → 单条保存 POST /api/teacher/score
+   或勾选学生批量录入 POST /api/teacher/score/batch
+④ TeacherController.updateScore() 接收 ScoreUpdateDTO
+⑤ SelectionService.updateScore() 更新 selection 表的 score 字段
+⑥ 学生端 GET /api/student/my-selections 查看更新后的成绩
+```
+
+### 2.3 前端实现
+
+#### 成绩录入页面（ScoreDetail.vue）
+
+```vue
+<template>
+  <!-- 学生成绩表格 -->
+  <el-table :data="selections">
+    <el-table-column prop="studentName" label="学生姓名" />
+    <el-table-column prop="courseName" label="课程" />
+    <el-table-column label="成绩">
+      <template slot-scope="scope">
+        <el-input-number v-model="scope.row.score" :min="0" :max="100" :precision="1" />
+      </template>
+    </el-table-column>
+    <el-table-column label="操作">
+      <template slot-scope="scope">
+        <el-button @click="saveScore(scope.row)">保存</el-button>
+      </template>
+    </el-table-column>
+  </el-table>
+
+  <!-- 批量录入 -->
+  <div>
+    <el-input-number v-model="batchScore" :min="0" :max="100" />
+    <el-button @click="batchInput">批量录入</el-button>
+  </div>
+</template>
+
+<script>
+// 单条成绩保存
+async saveScore(row) {
+  const res = await request.put('/api/teacher/score', {
+    selectionId: row.id,
+    score: row.score
+  });
+  this.$message.success('成绩保存成功');
+}
+
+// 批量录入（勾选的学生统一设为同一分数）
+async batchInput() {
+  const scores = this.selectedRows.map(r => ({
+    selectionId: r.id,
+    score: this.batchScore
+  }));
+  const res = await request.put('/api/teacher/score/batch', { scores });
+  this.$message.success('批量录入成功');
+}
+</script>
+```
+
+### 2.4 Controller 层
+
+```java
+// TeacherController.java
+@RestController
+@RequestMapping("/api/teacher")
+@PreAuthorize("hasRole('TEACHER') or hasRole('ADMIN')")
+public class TeacherController {
+
+    @Autowired private SelectionService selectionService;
+    @Autowired private UserService userService;
+
+    /**
+     * 查询选课记录（教师只能看自己教的课）
+     * 按 学期/课程/学生姓名 筛选
+     */
+    @GetMapping("/selections")
+    public Result<List<SelectionVO>> querySelections(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam(required = false) String term,
+            @RequestParam(required = false) Integer courseId,
+            @RequestParam(required = false) String studentName) {
+        Integer teacherId = userService.getUserIdByUsername(userDetails.getUsername());
+        // teacher_id 隔离：只返回该教师课程下的选课记录
+        List<SelectionVO> list = selectionService.getSelectionsByCondition(
+                teacherId, term, courseId, studentName);
+        return Result.success(list);
+    }
+
+    /**
+     * 录入/更新成绩（单条）
+     * @RequestBody ScoreUpdateDTO: { selectionId, score }
+     */
+    @PutMapping("/score")
+    public Result<?> updateScore(@RequestBody ScoreUpdateDTO dto) {
+        selectionService.updateScore(dto.getSelectionId(), dto.getScore());
+        return Result.success();
+    }
+
+    /**
+     * 批量录入成绩
+     * @RequestBody BatchScoreDTO: { scores: [{selectionId, score}, ...] }
+     */
+    @PutMapping("/score/batch")
+    public Result<?> batchUpdateScore(@RequestBody BatchScoreDTO dto) {
+        if (dto.getScores() != null) {
+            for (ScoreUpdateDTO s : dto.getScores()) {
+                selectionService.updateScore(s.getSelectionId(), s.getScore());
+            }
+        }
+        return Result.success();
+    }
+}
+```
+
+### 2.5 DTO 数据传输对象
+
+```java
+// ScoreUpdateDTO.java — 单条成绩更新
+@Data
+public class ScoreUpdateDTO {
+    private Integer selectionId;  // 选课记录ID
+    private Float score;          // 分数（0-100）
+}
+
+// BatchScoreDTO.java — 批量成绩录入
+@Data
+public class BatchScoreDTO {
+    private List<ScoreUpdateDTO> scores;  // 多条成绩记录
+}
+```
+
+### 2.6 Service 层
+
+```java
+// SelectionService.java
+/**
+ * 更新成绩: 教师录入/修改单个学生成绩
+ * 清除该学生的选课缓存（mySelections）
+ */
+public void updateScore(Integer selectionId, Float score) {
+    // 1. 查询选课记录
+    Selection selection = selectionMapper.selectById(selectionId);
+    if (selection != null) {
+        // 2. 设置新成绩
+        selection.setScore(score);
+        // 3. 更新数据库
+        selectionMapper.updateById(selection);  // UPDATE selection SET score=? WHERE id=?
+        // 4. 清除缓存日志
+        log.info("🔴 [Redis] 清除缓存 mySelections::{}（原因：成绩更新）",
+                 selection.getStudentId());
+    }
+}
+```
+
+### 2.7 Mapper 层（教师查询选课记录）
+
+```java
+// SelectionMapper.java — 教师条件查询（动态SQL）
+@Select("<script>" +
+        "SELECT s.id, s.student_id, s.course_id, s.score, s.select_time, " +
+        "c.name AS course_name, c.credit, c.term, " +
+        "u.real_name AS student_name " +
+        "FROM selection s " +
+        "LEFT JOIN course c ON s.course_id = c.id " +
+        "LEFT JOIN user u ON s.student_id = u.id " +
+        "WHERE c.teacher_id = #{teacherId} " +  // 固定条件：只查该教师的课
+        "<if test='term != null and term != \"\"'> AND c.term = #{term} </if>" +
+        "<if test='courseId != null'> AND s.course_id = #{courseId} </if>" +
+        "<if test='studentName != null and studentName != \"\"'>" +
+        " AND u.real_name LIKE CONCAT('%',#{studentName},'%') </if>" +
+        "</script>")
+List<SelectionVO> selectByCondition(@Param("teacherId") Integer teacherId,
+                                    @Param("term") String term,
+                                    @Param("courseId") Integer courseId,
+                                    @Param("studentName") String studentName);
+```
+
+**动态SQL说明**：
+- `<script>` 标签让 MyBatis 解析其中的动态标签
+- `<if>` 标签实现条件拼接：参数为 null 则不拼接到 SQL
+- `LIKE CONCAT('%',#{},'%')` 实现模糊搜索
+- `#{}` 占位符防止 SQL 注入
+
+### 2.8 成绩录入流程图
+
+```
+教师登录 → ScoreEntry.vue（课程列表）
+    │
+    │  GET /api/teacher/my-courses
+    ▼
+选择课程 → ScoreDetail.vue（学生表格）
+    │
+    │  GET /api/teacher/selections?courseId=123
+    │  （teacher_id 隔离，只返回自己的学生）
+    ▼
+┌─────────────────────────────┐
+│  单条录入           批量录入  │
+│  输入分数+保存     勾选+批量  │
+└──────────┬──────────────────┘
+           │
+   PUT /api/teacher/score      PUT /api/teacher/score/batch
+   {selectionId, score}        {scores:[{selectionId,score}...]}
+           │                           │
+           ▼                           ▼
+    SelectionService.updateScore (循环调用)
+           │
+           ▼
+    UPDATE selection SET score=? WHERE id=?
+           │
+           ▼
+    清除 mySelections 缓存
+           │
+           ▼
+    学生端刷新可见新成绩 ✅
+```
+
+### 2.9 学生端查看成绩
+
+```java
+// StudentController.java
+@GetMapping("/my-selections")
+public Result<List<SelectionVO>> getMySelections(@AuthenticationPrincipal UserDetails userDetails) {
+    Integer studentId = userService.getUserIdByUsername(userDetails.getUsername());
+    return Result.success(selectionService.getSelectionsByStudentId(studentId));
+    // @Cacheable 走 Redis 缓存，未命中查 MySQL
+}
+
+@GetMapping("/stats")
+public Result<Map<String, Object>> getStats(@AuthenticationPrincipal UserDetails userDetails) {
+    Integer studentId = userService.getUserIdByUsername(userDetails.getUsername());
+    List<SelectionVO> list = selectionService.getSelectionsByStudentId(studentId);
+    // Java Stream 计算统计
+    long gradedCourses = list.stream().filter(s -> s.getScore() != null).count();
+    double totalCredits = list.stream()
+            .filter(s -> s.getScore() != null && s.getCredit() != null)
+            .mapToDouble(SelectionVO::getCredit).sum();
+    long passedCourses = list.stream().filter(s -> s.getScore() != null && s.getScore() >= 60).count();
+    double avgScore = gradedCourses > 0 ? totalScore / gradedCourses : 0;
+    // 返回：总门数/总学分/已过/不及格数/平均分
+}
+```
+
+---
+
+## 模块三：AI智能助手流程
+
+### 3.1 模块概述
+
+| 项目 | 说明 |
+|------|------|
+| **入口端** | 全端（学生/教师/管理员均可） |
+| **接口路径** | `POST /api/ai/chat` |
+| **权限要求** | 已登录（JWT 解析 userId，无 `@PreAuthorize`） |
+| **核心类** | AIController → AIService → DeepSeek API |
+| **AI模型** | DeepSeek（兼容 OpenAI `/v1/chat/completions` 格式） |
+| **核心机制** | 按角色注入真实系统数据到 System Prompt |
+| **HTTP客户端** | RestTemplate（连接超时10s，读取超时60s） |
+
+### 3.2 完整调用链路
+
+```
+① 前端 AIChat.vue 发送消息 { message, currentPage }
+② AIController.chat() 从 Authorization 头解析 JWT → 获取 userId
+③ AIService.chat() 根据 userId 查 User → 获取 role（0/1/2）
+④ buildSystemPrompt() 按角色构造系统提示词（注入真实数据）
+⑤ callDeepSeek() 调用 DeepSeek API（RestTemplate POST）
+⑥ 解析 response.choices[0].message.content 返回
+⑦ 前端展示 AI 回复
+```
+
+### 3.3 前端实现（AIChat.vue）
+
+```vue
+<template>
+  <!-- 右下角浮动按钮 -->
+  <div class="ai-float-btn" @click="showChat = !showChat">🤖</div>
+
+  <!-- 聊天窗 390×540 -->
+  <div v-if="showChat" class="ai-chat-window">
+    <div class="chat-header">AI 智能助手</div>
+    <div class="chat-messages">
+      <div v-for="msg in messages">{{ msg.content }}</div>
+    </div>
+    <!-- 快捷问题（根据 currentPage 动态显示） -->
+    <div class="quick-questions">
+      <span @click="send(q)" v-for="q in quickQuestions">{{ q }}</span>
+    </div>
+    <input v-model="input" @keyup.enter="send(input)" placeholder="输入问题..." />
+  </div>
+</template>
+
+<script>
+export default {
+  methods: {
+    async send(message) {
+      // currentPage 用于场景识别（选课推荐/成绩分析等）
+      const currentPage = this.$route.path;
+      const res = await request.post('/api/ai/chat', { message, currentPage });
+      this.messages.push({ role: 'user', content: message });
+      this.messages.push({ role: 'assistant', content: res.data });
+    }
+  }
+}
+</script>
+```
+
+### 3.4 Controller 层
+
+```java
+// AIController.java
+@RestController
+@RequestMapping("/api/ai")
+public class AIController {
+
+    @Autowired private AIService aiService;
+    @Autowired private JwtUtil jwtUtil;
+
+    /**
+     * AI 对话接口
+     * @param params: { message: "用户输入", currentPage: "/student/courses" }
+     * @param authHeader: "Bearer xxx" — 从请求头获取 JWT
+     */
+    @PostMapping("/chat")
+    public Result<String> chat(@RequestBody Map<String, String> params,
+                                @RequestHeader("Authorization") String authHeader) {
+        // 1. 从 Token 解析 userId
+        String token = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
+        Integer userId = jwtUtil.getUserIdFromToken(token);
+
+        // 2. 获取参数
+        String message = params.get("message");
+        String currentPage = params.get("currentPage");
+
+        // 3. 空值校验
+        if (message == null || message.trim().isEmpty()) {
+            return Result.error("消息不能为空");
+        }
+
+        // 4. 调用 AI 服务
+        String reply = aiService.chat(message, currentPage, userId);
+        return Result.success(reply);
+    }
+}
+```
+
+### 3.5 ⭐ Service 层：按角色注入数据（核心）
+
+`AIService.chat()` 的核心是 `buildSystemPrompt()` 方法，根据用户角色注入不同的系统数据：
+
+```java
+// AIService.java
+@Slf4j
+@Service
+public class AIService {
+
+    @Autowired private AIConfig aiConfig;
+    @Autowired private RestTemplate restTemplate;
+    @Autowired private UserMapper userMapper;
+    @Autowired private SelectionService selectionService;
+    @Autowired private CourseService courseService;
+
+    public String chat(String userMessage, String currentPage, Integer userId) {
+        // 1. 查用户 → 获取角色
+        User user = userMapper.selectById(userId);
+        String roleName = getRoleName(user != null ? user.getRole() : null);
+        Integer role = user != null ? user.getRole() : null;
+
+        // 2. 按角色构建 System Prompt（注入真实数据）
+        String systemPrompt = buildSystemPrompt(currentPage, roleName, role, userId);
+
+        // 3. 调用 DeepSeek API
+        return callDeepSeek(systemPrompt, userMessage);
+    }
+}
+```
+
+#### 角色一：管理员（role=0）— 纯聊天模式
+
+```java
+// ===== 管理员端：纯聊天，不注入任何系统数据 =====
+if (role != null && role == 0) {
+    prompt.append("【模式：基础助手】");
+    prompt.append("你可以回答一般性问题，但不能查看学生成绩、课程详情等敏感数据。");
+    prompt.append("如果用户问成绩或课程相关问题，请回复：'抱歉，管理员模式下不提供数据查询功能，"
+                  + "请切换到教师或学生账号查看。'");
+    return prompt.toString();
+}
+```
+
+**说明**：管理员权限最高但不注入业务数据，防止 AI 泄露全局敏感信息。
+
+#### 角色二：学生（role=2）— 注入选课+成绩数据
+
+```java
+// ===== 学生端：注入选课+成绩数据 =====
+if (role != null && role == 2) {
+    prompt.append("【模式：学生智能体 — 已注入真实数据】\n\n");
+
+    // ① 注入可选课程列表
+    List<Course> availableCourses = courseService.getAvailableCourses();
+    for (Course c : availableCourses) {
+        prompt.append(String.format("· %s | 学分%.1f | 教师:%s | 容量:%d/%d | 学期:%s | 时间:%s\n",
+                c.getName(), c.getCredit(), c.getTeacherName(),
+                c.getSelected(), c.getCapacity(), c.getTerm(), c.getSchedule()));
+    }
+
+    // ② 注入我的选课记录（含成绩）
+    List<SelectionVO> mySelections = selectionService.getSelectionsByStudentId(userId);
+    double totalCredits = 0, totalScore = 0;
+    int gradedCount = 0;
+    for (SelectionVO s : mySelections) {
+        String scoreStr = s.getScore() != null ? String.format("%.1f分", s.getScore()) : "未出分";
+        prompt.append(String.format("· %s | 学分%.1f | 学期:%s | 成绩:%s\n",
+                s.getCourseName(), s.getCredit(), s.getTerm(), scoreStr));
+        if (s.getScore() != null && s.getCredit() != null) {
+            totalCredits += s.getCredit();
+            totalScore += s.getScore();
+            gradedCount++;
+        }
+    }
+    // 实时统计
+    prompt.append(String.format("\n📊 统计：已获学分 %.1f，已出分 %d 门，平均分 %.1f\n",
+            totalCredits, gradedCount, totalScore / gradedCount));
+
+    prompt.append("你可以：①根据可选课程推荐选课方案 ②分析我的成绩趋势 "
+                  + "③给出学习建议 ④回答课程相关问题。");
+    return prompt.toString();
+}
+```
+
+**说明**：注入两类数据——可选课程列表 + 我的选课成绩，AI 可做选课推荐和成绩分析。
+
+#### 角色三：教师（role=1）— 注入课程+学生成绩概要
+
+```java
+// ===== 教师端：注入所教课程+学生数据 =====
+if (role != null && role == 1) {
+    prompt.append("【模式：教师智能体 — 已注入真实数据】\n\n");
+
+    // ① 注入我教授的课程
+    List<Course> myCourses = courseService.getCoursesByTeacher(userId);
+    for (Course c : myCourses) {
+        prompt.append(String.format("· ID=%d %s | 学分%.1f | 已选%d/%d | 学期:%s | 状态:%s\n",
+                c.getId(), c.getName(), c.getCredit(),
+                c.getSelected(), c.getCapacity(), c.getTerm(),
+                c.getStatus() == 1 ? "进行中" : "已停用"));
+    }
+
+    // ② 注入每门课的学生成绩概要
+    for (Course c : myCourses) {
+        List<SelectionVO> selections = selectionService.getSelectionsByCondition(userId, null, c.getId(), null);
+        long graded = selections.stream().filter(s -> s.getScore() != null).count();
+        double avg = selections.stream().filter(s -> s.getScore() != null)
+                .mapToDouble(SelectionVO::getScore).average().orElse(0);
+        long passed = selections.stream().filter(s -> s.getScore() != null && s.getScore() >= 60).count();
+        prompt.append(String.format("· %s：共%d人选修，已出分%d人，平均%.1f分，通过%d人\n",
+                c.getName(), selections.size(), graded, avg, passed));
+    }
+
+    prompt.append("你可以：①分析班级成绩分布 ②对比各课程选课率 "
+                  + "③给出教学建议 ④回答课程管理问题。");
+    return prompt.toString();
+}
+```
+
+**说明**：注入教师所教课程 + 每门课的选修人数/平均分/通过率，AI 可分析班级成绩分布。
+
+### 3.6 调用 DeepSeek API
+
+```java
+// AIService.java
+private String callDeepSeek(String systemPrompt, String userMessage) {
+    String url = aiConfig.getApiUrl() + "/v1/chat/completions";
+
+    // 构造请求体（兼容 OpenAI 格式）
+    Map<String, Object> requestBody = new HashMap<>();
+    requestBody.put("model", "deepseek-chat");
+    requestBody.put("max_tokens", 600);    // 最大返回 600 token
+    requestBody.put("temperature", 0.7);   // 创造性参数
+
+    // messages: [系统提示词, 用户消息]
+    List<Map<String, String>> messages = new ArrayList<>();
+    messages.add(Map.of("role", "system", "content", systemPrompt));
+    messages.add(Map.of("role", "user", "content", userMessage));
+    requestBody.put("messages", messages);
+
+    // 请求头：Bearer Token 认证
+    HttpHeaders headers = new HttpHeaders();
+    headers.setContentType(MediaType.APPLICATION_JSON);
+    headers.setBearerAuth(aiConfig.getApiKey());
+
+    HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
+
+    try {
+        // RestTemplate 发起 POST 请求
+        ResponseEntity<Map> response = restTemplate.postForEntity(url, entity, Map.class);
+        Map<String, Object> body = response.getBody();
+        if (body != null) {
+            // 解析 choices[0].message.content
+            List<Map<String, Object>> choices = (List<Map<String, Object>>) body.get("choices");
+            if (choices != null && !choices.isEmpty()) {
+                Map<String, Object> message = (Map<String, Object>) choices.get(0).get("message");
+                if (message != null) return (String) message.get("content");
+            }
+        }
+        return "AI 暂时无法回复，请稍后再试。";
+    } catch (Exception e) {
+        log.error("调用 DeepSeek API 失败: {}", e.getMessage());
+        return "抱歉，AI 服务暂时不可用。请检查 API Key 是否正确配置。";
+    }
+}
+```
+
+### 3.7 配置层
+
+```java
+// AIConfig.java
+@Configuration
+public class AIConfig {
+
+    @Value("${ai.deepseek.api-url}") private String apiUrl;
+    @Value("${ai.deepseek.api-key}")  private String apiKey;
+
+    @Bean
+    public RestTemplate restTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(10000);   // 连接超时 10s
+        factory.setReadTimeout(60000);      // 读取超时 60s（AI 回复可能较慢）
+        return new RestTemplate(factory);
+    }
+}
+```
+
+```yaml
+# application.yml
+ai:
+  deepseek:
+    api-url: https://api.deepseek.com
+    api-key: sk-xxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+### 3.8 AI助手流程图
+
+```
+前端 AIChat.vue 发送消息
+   { message: "推荐几门课", currentPage: "/student/courses" }
+        │
+        │ POST /api/ai/chat
+        │ Header: Authorization: Bearer xxx
+        ▼
+┌─────────────────────────────────┐
+│      AIController.chat()        │
+│  ① 从 JWT 解析 userId           │
+│  ② 空值校验 message             │
+└──────────────┬──────────────────┘
+               ▼
+┌─────────────────────────────────┐
+│      AIService.chat()           │
+│  ③ 查 User 表获取 role          │
+│     role=0 管理员               │
+│     role=1 教师                 │
+│     role=2 学生                 │
+└──────────────┬──────────────────┘
+               ▼
+┌─────────────────────────────────┐
+│   buildSystemPrompt() 按角色    │
+│   注入真实数据                   │
+│                                 │
+│   管理员：纯聊天，不注入数据     │
+│   学生：可选课程 + 我的成绩     │
+│   教师：所教课程 + 班级概要     │
+└──────────────┬──────────────────┘
+               ▼
+┌─────────────────────────────────┐
+│     callDeepSeek()              │
+│  POST https://api.deepseek.com  │
+│       /v1/chat/completions      │
+│  Body: {model, messages, ...}   │
+│  Header: Bearer API_KEY         │
+└──────────────┬──────────────────┘
+               ▼
+┌─────────────────────────────────┐
+│  解析 choices[0].message.content│
+│  返回 AI 回复字符串              │
+└──────────────┬──────────────────┘
+               ▼
+        前端展示回复 ✅
+     "根据你的成绩，推荐选..."
+```
+
+### 3.9 AI助手三种角色对比
+
+| 角色 | 注入数据 | 可用功能 | 示例问答 |
+|------|----------|----------|----------|
+| **管理员(0)** | 无（纯聊天） | 通用问答 | "系统怎么用？" |
+| **学生(2)** | 可选课程 + 我的选课成绩 | 选课推荐、成绩分析、学习建议 | "推荐几门课"、"我成绩怎么样" |
+| **教师(1)** | 所教课程 + 班级成绩概要 | 成绩分布分析、教学建议 | "班级成绩如何"、"哪门课通过率低" |
+
+---
+
+## 通用：关键技术点总结
+
+### 1. JWT 认证机制（全模块通用）
+
+```java
+// JwtAuthenticationFilter.java — 每次请求自动执行
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(...) {
+        String token = request.getHeader("Authorization");
+        if (token != null && token.startsWith("Bearer ")) {
+            token = token.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                // 解析 Token → 设置 SecurityContext
+                UsernamePasswordAuthenticationToken auth = ...;
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+### 2. 权限控制（RBAC）
+
+| 注解 | 作用 | 应用位置 |
+|------|------|----------|
+| `@PreAuthorize("hasRole('STUDENT')")` | 学生权限 | StudentController |
+| `@PreAuthorize("hasRole('TEACHER')")` | 教师权限 | TeacherController |
+| `@PreAuthorize("hasRole('ADMIN')")` | 管理员权限 | AdminController |
+| `@AuthenticationPrincipal` | 获取当前用户 | 所有 Controller |
+
+### 3. 缓存策略（Redis）
+
+```java
+// 查询缓存（命中直接返回，未命中查 MySQL 写 Redis）
+@Cacheable(value = "mySelections", key = "#studentId")
+public List<SelectionVO> getSelectionsByStudentId(Integer studentId) { ... }
+
+// 数据变更时清除缓存
+@CacheEvict(value = "mySelections", key = "#studentId")
+public void selectCourse(Integer studentId, Integer courseId) { ... }
+```
+
+### 4. 异步消息（RabbitMQ）
+
+```java
+// 选课成功后异步发邮件（不阻塞主线程）
+mailProducer.sendMail(student.getEmail(), "选课成功通知", "...");
+
+// RabbitMQ 配置
+@Configuration
+public class RabbitMQConfig {
+    public static final String MAIL_QUEUE = "mail.queue";
+    @Bean
+    public Queue mailQueue() {
+        return QueueBuilder.durable(MAIL_QUEUE).build();
+    }
+}
+```
+
+### 5. 事务管理
+
+```java
+@Transactional  // 保证原子性：6步操作要么全成功要么全回滚
+@CacheEvict(value = "mySelections", key = "#studentId")
+public void selectCourse(Integer studentId, Integer courseId) {
+    // 6步校验 + 写操作
+    // 任一步抛 BusinessException → 事务回滚
+}
+```
+
+### 6. 统一响应与异常处理
+
+```java
+// 统一返回格式
+public class Result<T> {
+    private Integer code;    // 200成功 / 500失败
+    private String message;
+    private T data;
+}
+
+// 全局异常处理
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler(BusinessException.class)
+    public Result<?> handleBusinessException(BusinessException e) {
+        return Result.error(e.getMessage());  // 业务异常返回 500
+    }
+}
+```
+
+---
+
+## 三大模块对比总结
+
+| 维度 | 学生选课 | 成绩录入 | AI助手 |
+|------|----------|----------|--------|
+| **入口** | 学生端 | 教师端 | 全端 |
+| **接口** | POST /api/student/select | PUT /api/teacher/score | POST /api/ai/chat |
+| **权限** | ROLE_STUDENT | ROLE_TEACHER | 已登录即可 |
+| **Service** | SelectionService.selectCourse | SelectionService.updateScore | AIService.chat |
+| **事务** | @Transactional | 无（单条更新） | 无 |
+| **缓存** | @CacheEvict 清除 | 日志记录清除 | 读时走缓存 |
+| **数据库** | INSERT + UPDATE | UPDATE | 不写库（只读） |
+| **外部依赖** | RabbitMQ（邮件） | 无 | DeepSeek API |
+| **核心难点** | 6步校验+并发控制 | 权限隔离+批量处理 | 按角色数据注入 |
+
+---
+
+*文档结束*
+
+**生成时间**：2026-07-02  
+**文档版本**：v2.0（按模块重新组织，新增成绩录入与AI助手流程）  
+**技术支持**：Spring Boot 学生选课系统项目组
